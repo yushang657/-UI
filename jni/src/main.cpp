@@ -109,6 +109,38 @@ static double NowSec() {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+// 前置声明: ApplyVolumeKeySetting 里要用到 OnVolumeKey,
+// 而它的定义在下面 —— 不给声明就是 "use of undeclared identifier"。
+static void OnVolumeKey(const charlie::VolumeKeyEvent& e);
+
+// ============================================================
+// 按配置启停音量键监听
+//
+// 【为什么要单独一个函数】
+//   音量键监听会独占 /dev/input 的音量事件 —— 一旦我们在读,
+//   系统的音量调节就收不到了, 用户既调不了音量也不能静音。
+//   所以必须允许整个关掉。开关在设置页, 落到 cfg.volKey,
+//   由这里负责真正 Start/Stop 监听线程。
+//
+//   Stop() 之后 g_stopRequested 由下一次 Start() 重置,
+//   因此反复开关是安全的 (见 CharlieVolume.cpp 的 Start 实现)。
+// ============================================================
+static void ApplyVolumeKeySetting() {
+    const bool want = charlie::shell::Cfg().volKey;
+    const bool now  = charlie::volume::IsRunning();
+
+    if (want && !now) {
+        if (charlie::volume::Start(OnVolumeKey)) {
+            printf("[Charlie] 音量键: 已启用\n");
+        } else {
+            printf("[Charlie] 音量键: 启用失败 (无可用输入设备)\n");
+        }
+    } else if (!want && now) {
+        charlie::volume::Stop();
+        printf("[Charlie] 音量键: 已关闭, 交还给系统\n");
+    }
+}
+
 static void OnVolumeKey(const charlie::VolumeKeyEvent& e) {
     using namespace charlie;
     if (!e.down) return;   // 只处理按下, 忽略抬起与长按重复
@@ -200,21 +232,21 @@ static bool BuildRenderStack(int w, int h) {
     }
 
     // 字体 (上下文是新的, 必须清标志后重载)
-    // 字体选择从配置读, 但此刻壳层还没 Init, 配置尚未加载;
-    // 先用上次保存的默认值, 等 shell::Init 之后若发现配置不同再重载
+    // 【本轮变更】把「按档位加载单个字体」改成「一次性装载全部档位」。
+    //   旧实现每次切换都往图集里 Add 一个新字体, 既不重建 GPU 纹理,
+    //   也不改 io.FontDefault, 所以画面上永远停在第一个字体上。
+    //   现在图集只 Build 一次, 切换只换 io.FontDefault 指针。
     charlie::fonts::Reset();
-    charlie::fonts::LoadWith(charlie::shell::Cfg().fontId);
+    charlie::fonts::LoadAll();
     charlie::ApplyStyle();
     charlie::AnimResetAll();
 
     // 壳层度量按当前朝向重建
     charlie::shell::Init((float)w, (float)h, 1.f);
 
-    // Init 会读配置, 若字体与配置不符则重载一次
-    if (charlie::fonts::CurrentId() != charlie::shell::Cfg().fontId) {
-        charlie::fonts::Reset();
-        charlie::fonts::LoadWith(charlie::shell::Cfg().fontId);
-    }
+    // Init 会读配置: 此时才知道用户上次选的是哪一档。
+    // 图集已经在上面装好, 这里只是换指针, 零开销。
+    charlie::fonts::SetActive(charlie::shell::Cfg().fontId);
 
     printf("[Charlie] renderer: %s  layer: %dx%d\n",
            ::graphics->RenderName, w, h);
@@ -293,8 +325,10 @@ int main(int argc, char** argv) {
     charlie::shell::SetDisclaimerPath("./charlie_agreed.flag");
     charlie::shell::RequestOpen();
 
-    if (!charlie::volume::Start(OnVolumeKey)) {
-        printf("[Charlie] 音量键不可用, 窗口可点击灵动岛切换\n");
+    // 按配置决定要不要抢音量键。想抢就必须在设置页把开关打开。
+    ApplyVolumeKeySetting();
+    if (!charlie::volume::IsRunning()) {
+        printf("[Charlie] 音量键未启用, 窗口可点击灵动岛切换\n");
     }
 
     // ---------- 8. 主循环 ----------
@@ -303,6 +337,9 @@ int main(int argc, char** argv) {
     while (true) {
         if (g_sigExit) break;
         if (charlie::shell::ExitRequested()) break;
+
+        // 设置页翻动「音量控制」开关后, 下一帧就生效
+        ApplyVolumeKeySetting();
 
         // 朝向变化 -> 整体重建渲染栈
         if (charlie::display::Poll()) {

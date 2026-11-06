@@ -29,6 +29,11 @@
 namespace charlie {
 namespace shell {
 
+// 配置脏标记: 任何改动了需要持久化的字段都置位,
+// 由统一的落盘点(SaveConfig 调用处)消费后清零。
+// 存在的意义是防止同一次改动被多个路径重复写盘。
+static bool g_configDirty = false;
+
 // 控件库全部在 charlie::ui 下 (Combo / Toast / Button / BtnKind /
 // themeTransition / DrawToasts ...)。本文件是壳层, 通篇都在拼装这些控件,
 // 逐个写 ui:: 前缀只会让布局代码更难读。
@@ -52,7 +57,7 @@ Timeline g_closeTL;
 
 float  g_contentAlpha    = 0.f;
 float  g_pageFade        = 1.f;
-int    g_currentPage     = PAGE_DASHBOARD;
+int    g_currentPage     = PAGE_HOME;
 bool   g_pageResetScroll = false;
 
 bool   g_dragging = false;
@@ -119,8 +124,45 @@ void SetDisclaimerPath(const char* path) {
 // ============================================================
 // 配置持久化
 // ============================================================
+// ============================================================
+// 配置路径
+//
+// 【为什么不能用 "./charlie_layout.cfg"】
+//   su 启动时进程 cwd 是 "/", 而 Android 根分区是只读的
+//   (mount 显示 / 为 ro)。fopen 写配置直接拿到只读错误, 静默失败,
+//   于是"这次改的设置, 重启后全没了"。
+//   实测: /charlie_layout.cfg 报 Read-only file system。
+//
+// 【改成绝对路径】
+//   /data/charlie 是我们的安装目录, 已经存在且可写
+//   (二进制和启动脚本都在这里)。配置与二进制同目录,
+//   卸载/备份时一起处理, 不会散落在系统盘别处。
+//   目录不存在时(比如手动拷到别处跑)退到 /data/local/tmp。
+// ============================================================
+static const char* CfgDir() {
+    static char dir[192] = "";
+    if (dir[0]) return dir;
+
+    const char* cands[2] = { "/data/charlie", "/data/local/tmp" };
+    for (int i = 0; i < 2; ++i) {
+        // 用"能否创建文件"判断可写, 比 stat 权限位准
+        char probe[224];
+        snprintf(probe, sizeof(probe), "%s/.wtest", cands[i]);
+        FILE* f = fopen(probe, "wb");
+        if (f) { fclose(f); remove(probe); snprintf(dir, sizeof(dir), "%s", cands[i]); return dir; }
+    }
+    snprintf(dir, sizeof(dir), ".");
+    return dir;
+}
+
+static void CfgPath(char* out, size_t n) {
+    snprintf(out, n, "%s/charlie_layout.cfg", CfgDir());
+}
+
 void SaveConfig() {
-    FILE* fp = fopen("./charlie_layout.cfg", "wb");
+    char p[256];
+    CfgPath(p, sizeof(p));
+    FILE* fp = fopen(p, "wb");
     if (!fp) return;
     fprintf(fp, "uiScale %.4f\n",    g_cfg.uiScale);
     fprintf(fp, "themeIdx %d\n",     g_cfg.themeIdx);
@@ -128,17 +170,22 @@ void SaveConfig() {
     fprintf(fp, "islandTop %.4f\n",  g_cfg.islandTop);
     fprintf(fp, "navSide %d\n",      g_cfg.navSide);
     fprintf(fp, "fontId %d\n",       g_cfg.fontId);
+    fprintf(fp, "volKey %d\n",       g_cfg.volKey ? 1 : 0);
     fprintf(fp, "dragX %.3f\n",      g_dragOffset.x);
     fprintf(fp, "dragY %.3f\n",      g_dragOffset.y);
     fprintf(fp, "page %d\n",         g_currentPage);
     fprintf(fp, "dlgX %.3f\n",       g_disclaimerOffset.x);
     fprintf(fp, "dlgY %.3f\n",       g_disclaimerOffset.y);
     fclose(fp);
+    printf("[Charlie] config: 已保存 -> %s\n", p);
 }
 
 void LoadConfig() {
-    FILE* fp = fopen("./charlie_layout.cfg", "rb");
-    if (!fp) return;
+    char p[256];
+    CfgPath(p, sizeof(p));
+    FILE* fp = fopen(p, "rb");
+    if (!fp) { printf("[Charlie] config: 未找到 %s, 用默认值\n", p); return; }
+    printf("[Charlie] config: 读取 %s\n", p);
     char key[64];
     while (fscanf(fp, "%63s", key) == 1) {
         if      (!strcmp(key, "uiScale"))     fscanf(fp, "%f", &g_cfg.uiScale);
@@ -147,6 +194,10 @@ void LoadConfig() {
         else if (!strcmp(key, "islandTop"))   fscanf(fp, "%f", &g_cfg.islandTop);
         else if (!strcmp(key, "navSide"))     fscanf(fp, "%d", &g_cfg.navSide);
         else if (!strcmp(key, "fontId"))      fscanf(fp, "%d", &g_cfg.fontId);
+        else if (!strcmp(key, "volKey")) {
+            // 老配置没有这一项, 走结构体默认值 true (保持原有行为)
+            int v = 1; fscanf(fp, "%d", &v); g_cfg.volKey = (v != 0);
+        }
         else if (!strcmp(key, "dragX"))       fscanf(fp, "%f", &g_dragOffset.x);
         else if (!strcmp(key, "dragY"))       fscanf(fp, "%f", &g_dragOffset.y);
         else if (!strcmp(key, "page"))        fscanf(fp, "%d", &g_currentPage);
@@ -404,14 +455,56 @@ void DrawSidebar(const ImVec2& pos, const ImVec2& size, bool onRight) {
     const Palette& p = P();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
+    // ============================================================
+    // 侧栏底板
+    //
+    // 【本轮变更 · 右侧适配】
+    //   旧实现左右完全同款: AddRectFilled(pos, pos+size, m.radius) ——
+    //   四角都是大圆角, 但在右侧时, 侧栏的右边缘正好压在窗口右边缘上,
+    //   于是「侧栏右圆角」和「窗口右圆角」两层圆角叠在一起, 形成一道
+    //   粗细不均的月牙形亮边, 看起来像画歪了。
+    //
+    //   修法: 贴窗口边缘的那一侧不做圆角, 只有朝向内容区的一侧保留圆角。
+    //   ImDrawFlags_RoundCornersRight / RoundCornersLeft 正好对应:
+    //     - 侧栏在左: 左边缘贴窗口 → 只圆右边两个角
+    //     - 侧栏在右: 右边缘贴窗口 → 只圆左边两个角
+    //   这样侧栏轮廓始终是「外直角 + 内圆角」, 与 iOS 侧边栏一致。
+    // ============================================================
+    const ImDrawFlags rflags = onRight ? ImDrawFlags_RoundCornersLeft
+                                       : ImDrawFlags_RoundCornersRight;
+
+    // 右侧模式下侧栏整体向内收 1px, 避免与窗口描边落在同一列像素上
+    const ImVec2 s0 = onRight ? ImVec2(pos.x, pos.y) : pos;
+    const ImVec2 s1 = onRight ? ImVec2(pos.x + size.x - 1.f, pos.y + size.y)
+                              : ImVec2(pos.x + size.x, pos.y + size.y);
+
+    dl->AddRectFilled(s0, s1, WithAlpha(p.bgSide, 0.92f), m.radius, rflags);
+
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
                       WithAlpha(p.bgSide, 0.92f), m.radius);
 
     // 与内容区之间的分隔线
-    const float lx = onRight ? pos.x : (pos.x + size.x);
-    dl->AddLine(ImVec2(lx, pos.y + m.gap), ImVec2(lx, pos.y + size.y - m.gap),
-                WithAlpha(p.divider, 0.55f), ImMax(1.f, m.s * 0.9f));
-
+    // 【本轮变更 · 右侧适配】
+    //   旧实现不管左右都用 lx = onRight ? pos.x : pos.x + size.x,
+    //   再画一条 gap 到 size.y-gap 的竖线。放到右侧后有两个问题:
+    //     1) 竖线贴着窗口右边缘, 与窗口自身描边几乎重合, 看起来像双边框;
+    //     2) 线上下都留 gap, 但侧栏圆角半径是 m.radius, 两端露出缺口。
+    //   === 现在: 右侧不再画分隔线 ===
+    //   右侧栏与内容区之间用"留白 + 阴影"分隔, 这是 iOS 侧边栏的做法。
+    //   DrawSidebar 自己在左侧边缘压一层内阴影, 视觉层次比线更干净。
+    if (!onRight) {
+        const float lx = pos.x + size.x;
+        dl->AddLine(ImVec2(lx, pos.y + m.radius),
+                    ImVec2(lx, pos.y + size.y - m.radius),
+                    WithAlpha(p.divider, 0.55f), ImMax(1.f, m.s * 0.9f));
+    } else {
+        // 右侧: 沿侧栏左边缘画一层宽度渐隐的内阴影, 替代硬线
+        const float sw = 10.f * m.s;
+        dl->AddRectFilledMultiColor(
+            ImVec2(pos.x, pos.y), ImVec2(pos.x + sw, pos.y + size.y),
+            WithAlpha(p.shadow, 0.10f), IM_COL32(0, 0, 0, 0),
+            IM_COL32(0, 0, 0, 0), WithAlpha(p.shadow, 0.10f));
+    }
     // ---------- 品牌头 ----------
     // 高度与 titleH 解耦: 标题栏加高不该把导航按钮挤出可视区。
     const float bh = ImMin(size.y * 0.16f, 52.f * m.s) + m.gapS * 1.4f;
@@ -431,9 +524,30 @@ void DrawSidebar(const ImVec2& pos, const ImVec2& size, bool onRight) {
     }
 
     // ---------- 导航按钮 ----------
+    //
+    // 【本轮变更 · 右侧适配】
+    //   原实现左右两侧的几何完全一样, 只是把整块 pos 挪到右边。
+    //   放到右侧后暴露两个问题:
+    //     1) inset 是「左右对称内缩」, 右侧时按钮右边缘离窗口边缘还有
+    //        一段空隙, 而左侧时同一位置是贴着分隔线的 —— 视觉重心偏了;
+    //     2) 选中态指示条用 b1.x - 2.4 画在按钮右内侧, 右侧模式下这条
+    //        细线被夹在按钮和窗口边缘之间, 离内容区反而远了,
+    //        读起来像「选中了右边那个东西」。
+    //
+    //   现在按 onRight 分别处理:
+    //     - 左侧: 指示条贴按钮左边缘 (原行为)
+    //     - 右侧: 指示条贴按钮右边缘, 且靠窗口一侧不留 inset,
+    //             让指示条直接压在侧栏外沿上, 与左侧形态镜像对称。
+    //
+    //   另外按钮高度从 0.94 提到 1.02 倍 rowH —— 62px 的岛都加粗了,
+    //   导航按钮太瘦会显得整体上重下轻。间距同步收紧 0.9 -> 0.7,
+    //   保证 7 项在竖屏小窗口里仍然放得下。
     const float navTop = pos.y + bh + m.padY * 1.4f;
-    const float btnH   = m.rowH * 0.94f;
+    const float btnH   = m.rowH * 1.02f;
     const float inset  = m.gapS * 1.2f;
+    // 靠窗口那一侧的内缩: 左侧时贴窗口左沿, 右侧时贴窗口右沿
+    const float insetOut = m.gapS * 0.4f;   // 朝窗口外沿
+    const float insetIn  = inset;           // 朝内容区
 
     // 指针 (触摸优先) 与按下边沿。边沿用文件级 g_prevDown,
     // 保证整个侧栏只会有一个按钮在"刚按下"这一帧命中。
@@ -453,23 +567,37 @@ void DrawSidebar(const ImVec2& pos, const ImVec2& size, bool onRight) {
         const float by1 = y + btnH;
         if (by1 > pos.y + size.y - m.padY - m.rowH * 1.6f) break;
 
-        const ImVec2 b0(pos.x + inset, y);
-        const ImVec2 b1(pos.x + size.x - inset, by1);
+        // 不对称内缩: 靠窗口侧窄, 靠内容区侧宽
+        const float lx0 = onRight ? (pos.x + insetIn)  : (pos.x + insetOut);
+        const float lx1 = onRight ? (pos.x + size.x - insetOut)
+                                  : (pos.x + size.x - insetIn);
+        const ImVec2 b0(lx0, y);
+        const ImVec2 b1(lx1, by1);
 
         const bool active = (g_currentPage == i);
         const bool hover  = (tx >= b0.x && tx <= b1.x &&
                              ty >= b0.y && ty <= b1.y);
 
         if (active) {
-            dl->AddRectFilled(b0, b1, WithAlpha(p.accent, 0.16f), m.radiusS);
-            const float bx = onRight ? (b1.x - 2.4f * m.s) : b0.x;
-            dl->AddRectFilled(ImVec2(bx, b0.y + btnH * 0.22f),
-                              ImVec2(bx + 2.4f * m.s, b1.y - btnH * 0.22f),
-                              p.accent, 1.3f * m.s);
+            // 圆角只圆朝内容区那一侧, 贴窗口侧是直角 —— 与侧栏底板同一套逻辑
+            const ImDrawFlags bflags = onRight ? ImDrawFlags_RoundCornersLeft
+                                               : ImDrawFlags_RoundCornersRight;
+            dl->AddRectFilled(b0, b1, WithAlpha(p.accent, 0.16f), m.radiusS, bflags);
+
+            // 指示条: 左侧贴按钮左沿, 右侧贴按钮右沿 (镜像对称)
+            const float barW = 2.8f * m.s;
+            const float bx   = onRight ? (b1.x - barW) : b0.x;
+            dl->AddRectFilled(
+                ImVec2(bx, b0.y + btnH * 0.20f),
+                ImVec2(bx + barW, b1.y - btnH * 0.20f),
+                p.accent, barW * 0.5f);
         } else if (hover) {
-            dl->AddRectFilled(b0, b1, p.bgItemHover, m.radiusS);
+            const ImDrawFlags hflags = onRight ? ImDrawFlags_RoundCornersLeft
+                                               : ImDrawFlags_RoundCornersRight;
+            dl->AddRectFilled(b0, b1, p.bgItemHover, m.radiusS, hflags);
         }
 
+        // 文字居中于按钮实际矩形, 而不是侧栏整体
         const char* name = PageName(i);
         const ImVec2 ns = ImGui::CalcTextSize(name);
         dl->AddText(ImVec2(b0.x + (b1.x - b0.x - ns.x) * 0.5f,
@@ -484,7 +612,7 @@ void DrawSidebar(const ImVec2& pos, const ImVec2& size, bool onRight) {
             charlie::AnimResetAll();
         }
 
-        y = by1 + m.gapS * 0.9f;
+        y = by1 + m.gapS * 0.7f;
     }
 
     // ---------- 底部退出按钮 ----------
@@ -543,21 +671,29 @@ void DrawTitleBar(const ImVec2& pos, const ImVec2& size) {
     const ImVec2 h0(b0.x - hotP, b0.y - hotP);
     const ImVec2 h1(b1.x + hotP, b1.y + hotP);
     ImGui::SetCursorScreenPos(h0);
-    ImGui::InvisibleButton("##themeBtn",
-                           ImVec2(btnD + hotP * 2.f, btnD + hotP * 2.f));
-
-    // 指针 (触摸优先)
-    float tx = 0.f, ty = 0.f;
-    bool  tdown = false;
-    if (charlie::touch::IsRunning()) {
-        charlie::touch::GetPos(&tx, &ty);
-        tdown = charlie::touch::IsDown();
-    } else {
-        const ImGuiIO& io = ImGui::GetIO();
-        tx = io.MousePos.x; ty = io.MousePos.y; tdown = io.MouseDown[0];
-    }
-    const bool hov  = (tx >= h0.x && tx <= h1.x && ty >= h0.y && ty <= h1.y);
-    const bool edge = tdown && !g_prevDown;
+    // 【点击有时不切换的根因与修法】
+    //
+    //   旧写法把这个 InvisibleButton 的返回值丢弃了, 改用自己算的
+    //       edge = tdown && !g_prevDown
+    //   tdown 来自 charlie::touch::IsDown(), 那是"当前是否按着"的电平,
+    //   不是事件。快速轻点一下时, 按下与抬起可能落在同一个 select 批次里,
+    //   Commit() 只把 g_down 写成最终值 false —— 电平从没出现过 true。
+    //   于是 edge 永远不成立, 这一次点击被完整吞掉。
+    //
+    //   触发概率取决于点击时长与帧率: 帧率掉到 30fps 时窗口是 33ms,
+    //   轻点 (<33ms) 大概率整个落在同一批里, 表现为"点了没反应";
+    //   按得久一点 (>50ms) 就能跨帧, 表现为"有时候行"。
+    //   同一份代码在 CharlieWidgets 里没这个问题, 因为它用 TouchEdge()
+    //   (基于逐帧电平比较, 至少能看到中间帧), 但那依然是电平不是事件。
+    //
+    //   ImGui 自己的 InvisibleButton 内部用的是 ButtonBehavior,
+    //   而 ButtonBehavior 判定的是 io.MouseClicked[0] —— 那是由
+    //   AddMouseButtonEvent 排进输入队列的事件, 快速点击不会被合并。
+    //   touch::Pump() 已经把每个按下/抬起都投递进去了 (见 PushState 的注释),
+    //   所以直接用它的返回值, 走的是真正的事件路径。
+    const bool clicked = ImGui::InvisibleButton(
+        "##themeBtn", ImVec2(btnD + hotP * 2.f, btnD + hotP * 2.f));
+    const bool hov = ImGui::IsItemHovered();
 
     const bool  dark  = IsDark();
     const float ha    = hov ? 1.f : 0.f;
@@ -619,11 +755,14 @@ void DrawTitleBar(const ImVec2& pos, const ImVec2& size) {
     }
 
     // ---------- 切换 ----------
-    if (edge && hov) {
+    // clicked 已经是"本帧完成一次点击"的事件判定, 不再需要 hov 兜底:
+    // InvisibleButton 只有在指针压在按钮上时才会返回 true。
+    if (clicked) {
         const bool nd = !dark;
         g_cfg.themeIdx = nd ? 0 : 1;
         SetDark(nd);
         themeTransition::Start(nd);
+        g_configDirty = true;   // 主题要持久化
     }
 }
 
@@ -713,8 +852,15 @@ bool Frame() {
             g_closeProgress = g_closeTL.Eval(now, ease::InQuart);
         }
         if (g_closeProgress >= 1.f) {
+            // 【修复: 每帧重复落盘】
+            //   ForceClose() 之后状态已经切到 Hidden, 但闭屏分支本身还在这帧里,
+            //   g_closeProgress 保持 1.f, 于是这个 if 每帧都成立 ——
+            //   SaveConfig() 变成一个每帧 fopen/fprintf/fclose 的写盘循环。
+            //   实测日志里能连续看到 7 行 "config: 已保存"。
+            //   闭屏动画结束本来就该走一次, 用 g_configDirty 做一次性闸门。
             ForceClose();
-            SaveConfig();
+            if (g_configDirty) { SaveConfig(); g_configDirty = false; }
+            g_prevDown = pdown;   // 早退路径也必须提交, 否则下一帧边沿会重复触发
             DrawToasts();
 themeTransition::Draw();
             return true;
@@ -730,6 +876,7 @@ themeTransition::Draw();
 
     // 主面板已隐藏: 岛和 Toast 画完就收工
     if (!mainVisible) {
+        g_prevDown = pdown;   // 早退路径同样要提交
         DrawToasts();
 themeTransition::Draw();
         return true;
@@ -823,9 +970,16 @@ themeTransition::Draw();
 
         // ---- 侧栏 / 标题栏 / 内容区 ----
         // 导航栏位置: 0=左 (默认) 1=右
-        // 布局用 sideOnRight 分流, 内容区始终占另一侧
+        //
+        // 【本轮变更 · 右侧适配】侧栏宽度按侧别给不同上限:
+        //   右侧栏贴的是窗口右边缘, 与内容区之间没有分隔线(改成内阴影),
+        //   文字居中后两侧视觉留白不对称, 显得窄。这里右侧放宽 6%
+        //   并把整体上限从 34% 提到 36%, 保证"性能/设置"这类两字页名
+        //   不被挤到换行。左侧维持原值, 不动已验证过的观感。
         const bool sideOnRight = (g_cfg.navSide == 1);
-        const float sideW = ImMin(m.sideW, ws.x * 0.34f);
+        const float sideRatio  = sideOnRight ? 0.36f : 0.34f;
+        const float sideWide   = sideOnRight ? m.sideW * 1.06f : m.sideW;
+        const float sideW      = ImMin(sideWide, ws.x * sideRatio);
 
         ImVec2 sidePos = sideOnRight ? ImVec2(wp.x + ws.x - sideW, wp.y)
                                      : ImVec2(wp.x, wp.y);
@@ -1036,8 +1190,9 @@ themeTransition::Draw();
                     g_dragOffset.y = g_dragStartOffset.y + (mpNow.y - g_dragStartMouse.y);
                 } else {
                     // 松手: 结束拖动并落盘 (参考实现 SaveUiPosition)
+                    // 走脏标记, 由统一的落盘点写盘, 避免与闭屏分支重复。
                     g_dragging = false;
-                    SaveConfig();
+                    g_configDirty = true;
                 }
             }
             // 限制窗口不超出屏幕 (参考实现 L3090-3096)
@@ -1122,6 +1277,17 @@ themeTransition::Draw();
         }
         s_prevPopupOpen = popupOpenNow;
     }
+
+    // ---------- 帧末提交按下状态 ----------
+    // 【这是"明暗按钮连翻、下拉点不开"的总根因】
+    //   所有控件的边沿判定都是 edge = tdown && !g_prevDown。
+    //   但重建时漏掉了这一句提交, g_prevDown 永远是 false ——
+    //   于是手指只要按着, 每一帧 edge 都为真:
+    //     · 明暗按钮: 按住不动就每帧 flip 一次主题, 表现为狂闪/失灵
+    //     · 下拉表头: TouchEdge 每帧为真, 开->关->开 同帧内互相抵消,
+    //                 openNow 状态抖动, 表现为"点了没反应/点不开"
+    //   必须在整帧所有控件都读过之后才提交, 位置就在 DrawToasts 之前。
+    g_prevDown = pdown;
 
     // ---------- Toast ----------
     DrawToasts();

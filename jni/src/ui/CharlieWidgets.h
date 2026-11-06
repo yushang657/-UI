@@ -45,7 +45,13 @@ bool SliderCompact(const char* label, float* v, float lo, float hi,
 
 // ---------- 选择 ----------
 // 下拉: 内联展开, 不用 ImGui popup (原因见 .cpp 顶部注释)
-bool Combo(const char* label, int* idx, const char* const items[], int count);
+// 下拉框。
+//   label：用于 ID 唯一化，同时决定表头是否带前缀标签。
+//   showLabelInHeader：表头是否渲染 "标签: 当前项"。
+//     RowCombo 已经在左侧单独画了行标签，所以它传 false，
+//     表头只显示"当前项"，避免同一行里同一个词出现两次。
+bool Combo(const char* label, int* idx, const char* const items[], int count,
+           bool showLabelInHeader = true);
 
 // 强制收起当前展开的下拉 (面板关闭 / 切页 / 屏幕旋转时调用)
 void CloseOpenCombo();
@@ -61,6 +67,40 @@ bool ColorDots(const char* id, int* idx, const ImU32* colors, int count, float d
 
 // ---------- 折叠 ----------
 bool Collapse(const char* label, bool* open);
+
+// ============================================================
+// 二级标签条 (页面内子页切换)
+//
+// 【为什么自绘, 不用 ImGui::BeginTabBar】
+//   ImGui 原生 TabBar 内部走 ButtonBehavior + ItemHoverable,
+//   hover 依赖 g.HoveredWindow == 当前窗口 (imgui.cpp:4593)。
+//   本工程是 SurfaceComposer 图层 + 旁听 /dev/input 注入,
+//   弹窗关闭后焦点一旦不干净, 原生 Tab 就会集体点不动 ——
+//   这和之前 Toggle/Combo 踩到的是同一个坑。
+//   所以这里改成纯坐标命中 + TouchClaim 归属, 与其它控件同一套逻辑。
+//
+// 【视觉】
+//   下划线式: 文字 + 选中态底部 2px 强调条 + 轻微底色。
+//   不用胶囊分段, 因为页面宽度有限, 中文标签胶囊在 3 个以上时
+//   文字会被压得很挤; 下划线式横向占用更小, 也更贴近系统 Tab 的观感。
+//
+// 【用法】
+//   int& t = TabIndex(PAGE_AIM);      // 取本页当前子页下标 (自动跨帧保持)
+//   int  n = SubTabs("##aim", kNames, kCount, &t);
+//   if (n >= 0) t = n;                // 发生切换
+//   // 之后按 t 分发内容
+// ============================================================
+
+// 取某页的子页下标引用。首次访问返回 0。
+// 用函数内静态数组, 页面增删不用改任何声明; PAGE_COUNT 变了也能自适应。
+int& TabIndex(int pageId);
+
+// 只重绘不返回。返回用户点中的新下标, 未点击返回 -1。
+//   id      —— ImGui ID 作用域 (同一页内唯一即可)
+//   labels  —— 标签文字数组 (不含 "##")
+//   count   —— 标签数量
+//   cur     —— 当前选中下标, 越界自动夹到 [0, count-1]
+int SubTabs(const char* id, const char* const labels[], int count, int* cur);
 
 // ---------- 设置行 (标签在左, 控件在右) ----------
 // 统一的一列多控件排布: 每行一个控件, 标签左对齐、控件右对齐,

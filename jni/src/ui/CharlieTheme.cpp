@@ -207,10 +207,14 @@ void RebuildMetrics(float screenW, float screenH, float userScale) {
     //
     //   目标宽高比: 横屏 1.55, 竖屏 1.30 (竖屏可用宽度小, 略方一点)
     //   兜底区间: [1.15, 1.85]
-    float wRatio = landscape ? 0.62f : 0.92f;
+    // 【面板宽度】
+    //   0.62 (1495px) 太宽, 0.50 (1206px) 又太窄 —— 取 0.57。
+    //   在 2412x1080 上算出 1375px, 左右各留约 518px, 是"居中横向面板"的观感。
+    //   竖屏 0.92 保持不动: 竖屏可用宽度本来就小, 再收会挤。
+    float wRatio = landscape ? 0.57f : 0.92f;
 
-    // 占屏比上限: 不管屏幕多大, 面板都不超过屏幕的这个比例
-    const float wCapRatio = landscape ? 0.72f : 0.94f;
+    // 占屏比上限必须高于 wRatio, 否则上面的值会被这里再砍一刀。
+    const float wCapRatio = landscape ? 0.63f : 0.94f;
 
     // 绝对尺寸下限(可交互), 用 s 缩放以适配小屏
     const float wMin = 300.f * s;
@@ -224,7 +228,9 @@ void RebuildMetrics(float screenW, float screenH, float userScale) {
     if (w < wMin) w = wMin;
 
     // 高度: 由宽度按目标宽高比推导, 保证面板始终横向
-    const float targetAspect = landscape ? 1.55f : 1.30f;
+    //   1375 / 1.59 ≈ 865px —— 与下面 hScreenCap 的 864px 基本重合,
+    //   两者取小后稳定落在 864px, 不会出现"改了 targetAspect 却没变化"。
+    const float targetAspect = landscape ? 1.59f : 1.30f;
     float h = w / targetAspect;
 
     // 宽高比兜底: 极端屏幕下也保持横向观感
@@ -238,10 +244,15 @@ void RebuildMetrics(float screenW, float screenH, float userScale) {
     // 高会到 960 (占屏 89%), 上下几乎贴边, 观感很挤。
     // 这里额外加一道"高度不超过屏幕 72%"的限制。
     if (landscape) {
-        const float hScreenCap = screenH * 0.72f;
+        // 【这道上限曾经把高度死锁在 756px】
+        //   0.70 * 1080 = 756。上一版 targetAspect 算出来的 818px 被它砍到 756,
+        //   于是"调宽高比"完全无效 —— 用户看到的还是同一高度。
+        //   现在放到 0.80 (864px), 给宽高比留出真正的生效空间。
+        const float hScreenCap = screenH * 0.80f;
         if (h > hScreenCap) h = hScreenCap;
-        // 高度被压后宽度按兜底比例跟随, 保持横向观感
-        if (w / h < minAspect) w = h * minAspect;
+        // 高度被压后若宽度反而变窄, 只补到 minAspect, 不再反向放大宽度。
+        // (旧代码用 w = h * minAspect 会把刚收窄的宽度又撑回去)
+        if (w / h < minAspect) w = ImMin(h * minAspect, screenW * wCapRatio);
     }
 
     if (h < hMin) h = hMin;

@@ -8,11 +8,16 @@
 namespace charlie {
 
 // 页面索引 —— 新增页面在这里加, 导航与内容区自动跟随
+//
+// 【枚举顺序不可调整】
+//   charlie_layout.cfg 里存的是数字下标 (page %d)。
+//   这里只改名字和注释, 顺序保持原样, 老配置文件才不会跳到别的页面。
+//   真要插入新页, 加在 PAGE_ABOUT 之前并同步处理老配置的越界兜底。
 enum PageId {
-    PAGE_DASHBOARD = 0,   // 总览
-    PAGE_VISUAL,          // 视觉
-    PAGE_AIM,             // 操控
-    PAGE_MISC,            // 杂项
+    PAGE_HOME = 0,        // 主页
+    PAGE_AIM,             // 自瞄
+    PAGE_VISUAL,          // 绘制
+    PAGE_MISC,            // 辅助
     PAGE_PERF,            // 性能 (实时 CPU/内存/帧率)
     PAGE_SETTINGS,        // 设置
     PAGE_ABOUT,           // 关于
@@ -21,7 +26,7 @@ enum PageId {
 
 inline const char* PageName(int i) {
     static const char* names[PAGE_COUNT] = {
-        "总览", "视觉", "操控", "杂项", "性能", "设置", "关于"
+        "主页", "自瞄", "绘制", "辅助", "性能", "设置", "关于"
     };
     if (i < 0 || i >= PAGE_COUNT) return "";
     return names[i];
@@ -29,8 +34,9 @@ inline const char* PageName(int i) {
 
 inline const char* PageDesc(int i) {
     static const char* desc[PAGE_COUNT] = {
-        "Charlie 状态面板", "显示相关开关", "操作与灵敏度", "辅助功能占位",
-        "实时资源占用", "界面与外观", "版本与声明"
+        "运行状态与快捷开关", "瞄准、跟随与部位选择", "屏幕绘制项目与样式",
+        "战斗辅助与行为开关", "实时资源占用", "界面、动效与性能",
+        "版本信息与声明"
     };
     if (i < 0 || i >= PAGE_COUNT) return "";
     return desc[i];
@@ -51,6 +57,16 @@ struct Features {
     float espRange    = 300.f;
     float boxWidth    = 1.5f;
 
+    // ---- 绘制 · 扩充占位 (仅界面, 无业务逻辑) ----
+    bool  espWeapon   = false;   // 武器
+    bool  espTeam     = false;   // 队伍
+    bool  espReload   = false;   // 换弹提示
+    bool  espAmmo     = false;   // 弹药
+    int   espColor    = 0;       // 配色方案
+    float espFill     = 0.15f;   // 框体内填充不透明度
+    float espTextSize = 1.0f;    // 文字缩放
+    bool  espOutline  = true;    // 描边
+
     // 操控
     bool  aimEnable   = false;
     bool  aimSmooth   = true;
@@ -60,6 +76,16 @@ struct Features {
     float aimFov      = 120.f;
     int   aimPart     = 0;
 
+    // ---- 自瞄 · 扩充占位 ----
+    int   aimMode     = 0;       // 0=触摸 1=陀螺仪
+    int   aimBone     = 0;       // 锁定骨骼优先
+    float aimStrength = 50.f;    // 吸附强度
+    float aimSmoothK  = 30.f;    // 平滑系数
+    float aimTrigger  = 0.f;     // 扳机阈值
+    bool  aimTouch    = false;   // 触摸面板
+    bool  aimScope    = false;   // 开镜才生效
+    bool  aimIgnoreDn = true;    // 忽略倒地
+
     // 杂项
     bool  antiShake   = false;
     bool  fastSwap    = false;
@@ -67,6 +93,15 @@ struct Features {
     bool  autoFire    = false;
     int   perfMode    = 1;
     float fpsLimit    = 60.f;
+
+    // ---- 辅助 · 扩充占位 ----
+    bool  autoPick    = false;   // 自动拾取
+    bool  noFlash     = false;   // 无闪光
+    bool  noSmoke     = false;   // 无烟雾
+    bool  bigHead     = false;   // 大头
+    bool  speedHack   = false;   // 加速
+    bool  skinChange  = false;   // 换肤
+    float pickRange   = 30.f;    // 拾取范围
 
     // 设置
     bool  showFps     = true;

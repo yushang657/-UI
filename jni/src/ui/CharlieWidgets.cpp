@@ -4,6 +4,8 @@
 #include "CharlieWidgets.h"
 #include "CharlieTheme.h"
 #include "CharlieAnim.h"
+// SubTabs 的子页状态按页面数定长, 需要 PAGE_COUNT。
+#include "CharlieState.h"
 
 // 触摸层原生状态 —— 控件的兜底点击路径要用, 见 Toggle() 里的说明。
 #include "../platform/CharlieTouch.h"
@@ -152,10 +154,51 @@ const char* Ellipsize(const char* src, float maxW, char* out, int outCap) {
     return out;
 }
 
+// ============================================================
+// 组间距专用倍率
+//
+// Gap() 只服务于「组与组之间」—— 页面里 25 处调用、
+// Section 标题上方、EndCard 之后。控件内部的内边距走的是
+// m.gapS / m.cardPad，不经过这里, 所以放大它不会让开关、
+// 滑块的内部变松。
+//
+// 想整体调松紧只改这一个数:
+//   1.0 = 原始参数值 (偏紧, 上一版就是 0.5 以下)
+//   1.8 = 当前值 (组间清晰但不空)
+//   2.5 = 宽松
+// ============================================================
+constexpr float kGapScale = 1.8f;
+
 void Gap(float h) {
     if (h < 0.f) h = M().gap;
-    ImGui::Dummy(ImVec2(1.f, h));
+
+    // ============================================================
+    // 【不用 Dummy, 也不扣 ItemSpacing】
+    //
+    // 历史两次踩坑:
+    //
+    // ① Dummy 版本
+    //    Dummy 是真实 item, 对 cursor 的贡献是三段:
+    //      上一 item 的 ItemSpacing + Dummy 高度 + Dummy 后的 ItemSpacing
+    //    传 h 进去净推进是 h + 2*sp。sp = 6.14, gapS = 6.51 ——
+    //    一个"半个 gapS"的缝吃掉 18.8px, 近 3 倍。
+    //    组标题上下各一次、Divider 上下各一次、EndCard 一次、
+    //    页面 25 处 —— 叠加后带标题的组之间 66.5px。
+    //
+    // ② 扣 2*sp 版本
+    //    为了抵消 ①, 改成 SetCursorPosY(+h-2*sp)。但扣除的前提是
+    //    "下一个 item 会自己加回两次 spacing" —— 而 BeginCard() 和
+    //    Section() 都用 SetCursorScreenPos **绝对定位**, 不参与
+    //    ItemSpacing 累加。扣除不成立, 于是 h-2*sp 常常是负数,
+    //    间距被压到接近 0 —— 就是"紧了"。
+    //
+    // 现在: 只做 SetCursorPosY(+h * kGapScale)。
+    //   不产生 item, 不依赖后续控件的行为, 净推进精确且可预测。
+    // ============================================================
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + h * kGapScale);
 }
+
+
 
 void Spacer(float w) {
     ImGui::SameLine(0.f, w);
@@ -164,7 +207,15 @@ void Spacer(float w) {
 void Section(const char* title) {
     const Metrics& m = M();
     const Palette& p = P();
-    ImGui::Dummy(ImVec2(1.f, m.gapS * 0.5f));
+
+    // 【标题上方留白】
+    // 原来这里是裸 Dummy(gapS*0.5): Dummy 是真实 item,
+    // 前后各叠一次 ItemSpacing, 于是一个"半个 gapS(3.26)"的间距
+    // 实际占掉 6.14+3.26+6.14 = 15.54px, 翻了近 5 倍。
+    // 组标题上下各来一次, 带标题的组之间就隔了 66.5px ——
+    // 这就是"组间留白太多"的主因, 而不是卡片本身。
+    // 现在统一走 Gap(), 净推进就是参数值。
+    Gap(m.gapS);
 
     ImVec2 cp = ImGui::GetCursorScreenPos();
     const float h  = m.fontS * 1.5f;
@@ -193,7 +244,10 @@ void Section(const char* title) {
             WithAlpha(p.divider, 0.9f), WithAlpha(p.divider, 0.0f),
             WithAlpha(p.divider, 0.0f), WithAlpha(p.divider, 0.9f));
     }
-    ImGui::Dummy(ImVec2(1.f, m.gapS * 0.6f));
+    // 【标题下方留白】不再手动补。
+    // 标题本身是 Text item, 结束后 ImGui 已经推进了 ItemSpacing,
+    // 再叠一个 Dummy 就是第三次叠加。下一张卡片前的那次
+    // ItemSpacing 由 BeginCard 自动获得, 足够分开。
 }
 
 void Label(const char* text, bool sub) {
@@ -211,14 +265,23 @@ void Label(const char* text, bool sub) {
 void Divider() {
     const Metrics& m = M();
     const Palette& p = P();
+
+    // 【裸 Dummy 当间距 = 三倍浪费】
+    //   Dummy 是真实 item, 前一次 ItemSpacing + 自身高度 + 后一次
+    //   ItemSpacing, 三段都算进 cursor。gapS*0.5 = 3.26 的"小缝"
+    //   实际吃掉 6.14 + 3.26 + 6.14 = 15.54px。
+    //   上下各一次 = 31px 空白, 而分隔线只有 1px —— 这就是
+    //   "分隔线周围空得离谱"的来源。
+    //
+    //   现在: 线本身用 AddLine 直接画在当前 cursor 上(不吃 item),
+    //   上下留白只靠调用方已有的 ItemSpacing, 净空 0。
+    //   需要更宽的分隔就由调用方 Gap() 控制, 语义单一。
     ImVec2 cp = ImGui::GetCursorScreenPos();
-    float avail = ImGui::GetContentRegionAvail().x;
-    ImGui::Dummy(ImVec2(1.f, m.gapS * 0.5f));
-    cp = ImGui::GetCursorScreenPos();
+    const float avail = ImGui::GetContentRegionAvail().x;
     ImGui::GetWindowDrawList()->AddRectFilled(
         ImVec2(cp.x, cp.y), ImVec2(cp.x + avail, cp.y + 1.f),
         WithAlpha(p.divider, 0.75f));
-    ImGui::Dummy(ImVec2(1.f, m.gapS * 0.5f));
+    (void)m;
 }
 
 // ============================================================
@@ -311,8 +374,15 @@ void EndCard() {
     if (g_cardDepth > 0) autoH = g_cardAuto[--g_cardDepth].autoH;
 
     ImGui::EndChild();
-    // Child 已消费了高度, 这里只补间距
-    Gap(m.gapS);
+    // 【不再自动补距】
+    //
+    // 原来这里 Gap(m.gapS), 而页面代码在每个 EndCard 后面又写了一次
+    // Gap(m.gapS) —— 两处叠加, 再加上 Gap 自己的 ItemSpacing 翻倍,
+    // 两张卡片之间实测 25.3px, 视觉上就是"空了一大块"。
+    //
+    // 现在把组间距的唯一控制权交给调用方: 页面里那 25 处显式
+    // Gap(m.gapS) 就是全部间距, 不再有隐藏的一层。
+    // EndChild 本身已经推进了 cursor(含 ItemSpacing), 足够分开了。
     (void)autoH;
 }
 
@@ -704,6 +774,141 @@ bool SliderCompact(const char* label, float* v, float lo, float hi,
 }
 
 // ============================================================
+// 二级标签条
+// ============================================================
+
+// 每个页面各自的子页下标。
+// 用 PAGE_COUNT 定长数组: 页面数量在 CharlieState.h 里是编译期常量,
+// 这里直接对齐, 不需要额外的注册/扩容逻辑。
+// 初值 0 = 进入任何页面默认落在第一个子页。
+static int  g_subTab[charlie::PAGE_COUNT] = {};
+static bool g_subTabInit = false;
+
+int& TabIndex(int pageId) {
+    if (!g_subTabInit) {
+        for (int i = 0; i < charlie::PAGE_COUNT; ++i) g_subTab[i] = 0;
+        g_subTabInit = true;
+    }
+    if (pageId < 0) pageId = 0;
+    if (pageId >= charlie::PAGE_COUNT) pageId = charlie::PAGE_COUNT - 1;
+    return g_subTab[pageId];
+}
+
+int SubTabs(const char* id, const char* const labels[], int count, int* cur) {
+    const Metrics& m = M();
+    const Palette& p = P();
+    if (!labels || count <= 0 || !cur) return -1;
+
+    if (*cur < 0)     *cur = 0;
+    if (*cur >= count) *cur = count - 1;
+
+    ImGui::PushID(id ? id : "##sub");
+
+    // ---------- 指针状态 ----------
+    float tx = 0.f, ty = 0.f;
+    bool  tdown = false;
+    if (charlie::touch::IsRunning()) {
+        charlie::touch::GetPos(&tx, &ty);
+        tdown = charlie::touch::IsDown();
+    } else {
+        const ImGuiIO& dio = ImGui::GetIO();
+        tx = dio.MousePos.x;  ty = dio.MousePos.y;  tdown = dio.MouseDown[0];
+    }
+
+    const float barH = m.rowH * 0.92f;
+    ImVec2 cp = ImGui::GetCursorScreenPos();
+    const float availW = ImGui::GetContentRegionAvail().x;
+
+    // ---------- 先量文字, 再均分 ----------
+    // 【为什么不固定等分】
+    //   "主页/自瞄/绘制" 是两字, "快捷键" 是三字, 等分会让两字标签
+    //   左右留下大片空白, 三字标签却挤到边。这里按文字宽 + 内边距
+    //   分配, 剩余宽度平均补到每个标签上, 整条正好铺满行宽。
+    float textW[16];
+    int   useN = count > 16 ? 16 : count;
+    float sumText = 0.f;
+    for (int i = 0; i < useN; ++i) {
+        textW[i] = ImGui::CalcTextSize(labels[i] ? labels[i] : "").x;
+        sumText += textW[i];
+    }
+    const float padEach = m.gap * 1.6f;
+    float spare = availW - sumText - padEach * (float)useN;
+    float addEach = spare > 0.f ? spare / (float)useN : 0.f;
+
+    // ---------- 命中: 按下边沿 + 归属 ----------
+    // 与 Toggle / Combo 同一套: 全帧只认一次按下边沿,
+    // 且一次按下只能被一个控件认领, 避免和相邻控件抢事件。
+    int hit = -1;
+    if (ty >= cp.y && ty <= cp.y + barH) {
+        float x = cp.x;
+        for (int i = 0; i < useN; ++i) {
+            float wSeg = textW[i] + padEach + addEach;
+            if (tx >= x && tx <= x + wSeg) { hit = i; break; }
+            x += wSeg;
+        }
+    }
+    const bool pressedEdge = TouchEdge(tdown);
+    if (!(hit >= 0 && pressedEdge &&
+          TouchClaim((const void*)(intptr_t)(0xA100 + hit)))) {
+        hit = -1;
+    }
+
+    const int before = *cur;
+    if (hit >= 0 && hit != before) *cur = hit;
+
+    // ---------- 绘制 ----------
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // 底部基线: 整条一条极淡的横线, 选中项用强调色覆盖
+    const float baseY = cp.y + barH - 1.5f * m.s;
+    dl->AddRectFilled(ImVec2(cp.x, baseY), ImVec2(cp.x + availW, baseY + 1.f),
+                      WithAlpha(p.divider, 0.55f));
+
+    const ImU32 colOn  = p.accent;
+    const ImU32 colOff = p.textMid;
+
+    float x = cp.x;
+    for (int i = 0; i < useN; ++i) {
+        const float wSeg = textW[i] + padEach + addEach;
+        const bool  on   = (i == *cur);
+
+        // 悬停底色 (只对当前指针所在段生效)
+        const bool hov = (tx >= x && tx <= x + wSeg &&
+                          ty >= cp.y && ty <= cp.y + barH);
+
+        if (on || hov) {
+            dl->AddRectFilled(
+                ImVec2(x + 1.f, cp.y + 1.f),
+                ImVec2(x + wSeg - 1.f, baseY),
+                on ? WithAlpha(p.accent, 0.10f) : WithAlpha(p.bgItemHover, 0.55f),
+                m.radiusS);
+        }
+
+        // 文字居中
+        const ImVec2 ts = ImGui::CalcTextSize(labels[i] ? labels[i] : "");
+        dl->AddText(ImVec2(x + (wSeg - ts.x) * 0.5f, cp.y + (barH - ts.y) * 0.5f),
+                    on ? colOn : (hov ? p.textHi : colOff),
+                    labels[i] ? labels[i] : "");
+
+        // 选中下划线
+        if (on) {
+            dl->AddRectFilled(
+                ImVec2(x + padEach * 0.5f, baseY - 1.f),
+                ImVec2(x + wSeg - padEach * 0.5f, baseY + 1.5f * m.s),
+                p.accent, 1.f);
+        }
+
+        x += wSeg;
+    }
+
+    // 占位推进光标 (不画 ImGui item, 靠 DoneDummy 手动推)
+    ImGui::SetCursorScreenPos(ImVec2(cp.x, cp.y + barH));
+
+    ImGui::PopID();
+    return (hit >= 0 && hit != before) ? hit : -1;
+}
+
+// ============================================================
 // 下拉 —— 浮层覆盖实现 (外连样式)
 //
 // 【历史两版的取舍】
@@ -732,15 +937,20 @@ static ImGuiID g_openComboId  = 0;
 static ImVec2  g_openComboPos(0.f, 0.f);   // 浮层左上角
 static ImVec2  g_openComboSize(0.f, 0.f);  // 浮层尺寸
 
-bool Combo(const char* label, int* idx, const char* const items[], int count) {
+bool Combo(const char* label, int* idx, const char* const items[], int count,
+           bool showLabelInHeader) {
     const Metrics& m = M();
     const Palette& p = P();
     if (!idx || !items || count <= 0) return false;
     if (!label) label = "";
 
-    // label 允许为空串 (RowCombo 在外层已经单独画了行标签)。
-    // PushID("") 仍然会叠一层 ID 栈, 配合下面的 GetID("##cb"),
-    // 不同行的下拉依然互不冲突, 因为外层 RowCombo 已 PushID(唯一标签)。
+    // label 允许为空串: RowCombo 已经在外层单独画了行标签, 这里只管下拉本体。
+    //
+    // 【ID 作用域】
+    //   ID 唯一性不靠这里的 label, 靠调用方外层 PushID。
+    //   RowCombo 在调用前已经 PushID(真实行标签), 所以不同行的下拉
+    //   落在不同的 ID 栈作用域, GetID("##cb") 自然不同。
+    //   直接把 label 传进来也只是多叠一层, 空串同样成立。
     ImGui::PushID(label);
     const ImGuiID myId = ImGui::GetID("##cb");
 
@@ -790,11 +1000,9 @@ bool Combo(const char* label, int* idx, const char* const items[], int count) {
                 m.radiusS, 0, openNow ? (1.6f * m.s) : 1.f);
 
     // 【标签里的 "##" 必须剥掉】
-    //   RowCombo 传进来的 label 是 "##c" —— 那只是给 PushID/GetID 用的唯一化后缀,
-    //   不是给人看的文字。原来直接 snprintf("%s: %s", label, ...), 表头就渲染成
-    //   "##c: 灵动岛内", 把 ImGui 的内部标记漏到了界面上。
-    //   ImGui 原生控件的规矩是 "显示文字##唯一ID", 这里补上同样的处理:
-    //   取 "##" 之前的可见部分, 没有 "##" 就整串都是可见部分。
+    //   RowCombo 现在传进来的是真实行标签(如"帧率位置"), 不含 "##"。
+    //   但 Combo 是公开接口, 别处仍可能按 ImGui 惯例传 "显示文字##唯一ID"。
+    //   这里统一剥掉 "##" 及其后内容, 保证任何调用方都不会把内部标记漏到界面上。
     char visLabel[128];
     {
         const char* hash = strstr(label, "##");
@@ -806,14 +1014,20 @@ bool Combo(const char* label, int* idx, const char* const items[], int count) {
     }
 
     char buf[256];
-    if (visLabel[0]) {
+    // 【表头是否带前缀标签】
+    //   RowCombo 的布局是「左侧行标签 + 右侧下拉框」,
+    //   如果下拉表头再拼一次 "帧率位置: 灵动岛内", 同一行里
+    //   "帧率位置" 会出现两次, 既是重复信息也挤占选项文字的宽度。
+    //   所以 RowCombo 传 showLabelInHeader=false, 表头只留当前选中项。
+    if (showLabelInHeader && visLabel[0]) {
         snprintf(buf, sizeof(buf), "%s: %s", visLabel,
                  items[(*idx >= 0 && *idx < count) ? *idx : 0]);
     } else {
-        // 没有可见标签时只显示当前项, 不留下 ": xxx" 前面那个孤零零的冒号
+        // 只显示当前项, 不留孤零零的冒号
         snprintf(buf, sizeof(buf), "%s",
                  items[(*idx >= 0 && *idx < count) ? *idx : 0]);
     }
+    // 表头文字可用宽度: 右侧留给展开箭头, 左右各留一个 gap
     const float textMaxW = w - m.gap * 2.f - m.gap * 1.2f - 6.f * m.s;
     char trimmed[256];
     Ellipsize(buf, textMaxW, trimmed, (int)sizeof(trimmed));
@@ -886,8 +1100,10 @@ bool Combo(const char* label, int* idx, const char* const items[], int count) {
                         sel ? p.accent : p.textHi, ibuf);
 
             // 两条边沿都收: 直接点选项 / 按住表头拖过来再抬
+            // key 必须带上 myId: 只用 0x9000+i 的话, 不同下拉的第 i 项
+            // 会是同一个 key, 同一帧里可能被别的下拉抢走认领。
             if (inItem && (TouchEdge(tdown) || TouchRelease(tdown)) &&
-                TouchClaim((const void*)(intptr_t)(0x9000 + i))) {
+                TouchClaim((const void*)(intptr_t)(myId ^ (uintptr_t)(0x9000 + i)))) {
                 *idx = i;
                 changed = true;
                 g_openComboId = 0;
@@ -1544,15 +1760,13 @@ bool RowCombo(const char* label, int* idx, const char* const items[], int count,
     const float comboTop = cp.y + (rh - comboH) * 0.5f;
     ImGui::SetCursorScreenPos(ImVec2(cp.x + rowW - comboW - m.gapS, comboTop));
     ImGui::PushItemWidth(comboW);
-    // 【传空串, 不传 "##c"】
-    //   历史写法 Combo("##c", ...) 是把 ImGui 的内部唯一化后缀当成 label 用。
-    //   Combo 内部虽然补了剥离, 但只要有任何一条绘制路径没剥到
-    //   (AddText / TextUnformatted / 未来新增的分支), "##c" 就会直接印在界面上。
-    //
-    //   这里改成空串: 空串在任何绘制路径下都渲染不出像素, 泄漏面归零。
-    //   ID 唯一性不受影响 —— RowCombo 外层已经 PushID(真实标签) 包住了本行,
-    //   Combo 内部的 PushID("") + GetID("##cb") 仍落在该行的 ID 栈里。
-    bool changed = Combo("", idx, items, count);
+    // 【表头只显示当前选中项】
+    //   label 仍然要传: Combo 内部用 PushID(label) + GetID("##cb") 生成唯一 ID,
+    //   传空串会让同页多个下拉算到同一个 ID —— 那是"只能打开一个"的成因。
+    //   但第 5 个参数 showLabelInHeader 传 false:
+    //   本行左侧已经用 TextUnformatted 画了"帧率位置",
+    //   表头再拼一次就成了"帧率位置: 灵动岛内", 同一行出现两次标签。
+    bool changed = Combo(label, idx, items, count, /*showLabelInHeader=*/false);
     ImGui::PopItemWidth();
 
     dl->AddRectFilled(ImVec2(cp.x, cp.y + rh - 1.f), ImVec2(cp.x + rowW, cp.y + rh),
